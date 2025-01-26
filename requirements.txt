@@ -104,7 +104,7 @@ portalocker==2.10.1
 propcache==0.2.0
 proto-plus==1.25.0
 protobuf==5.28.3
-psycopyg2-binary
+psycopg2-binary
 pyarrow==18.0.0
 pyasn1==0.6.1
 pyasn1_modules==0.4.1
