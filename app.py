@@ -186,7 +186,7 @@ CORS(app, resources={
         "origins": [
             "http://localhost:5173",
             "https://your-frontend-url.vercel.app",
-            "*"
+            "https://your-render-url.onrender.com"
         ],
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
@@ -387,7 +387,29 @@ def download_pdf(challan_id):
         logger.error(f"Error downloading PDF: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    try:
+        # Test database connection
+        conn = get_db_connection()
+        conn.close()
+        return jsonify({
+            "status": "healthy",
+            "database": "connected",
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 500
+
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
+
+
 
 
