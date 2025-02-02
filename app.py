@@ -55,21 +55,30 @@ def root():
 def generate_pdf():
     try:
         data = request.json
+        if not data or 'challan_no' not in data:
+            return jsonify({"error": "Challan number is required"}), 400
+            
         challan_no = data.get('challan_no')
         
         with get_db_connection() as conn:
             with conn.cursor() as cur:
+                # Debug log
+                logger.info(f"Fetching challan with number: {challan_no}")
+                
                 cur.execute("""
                     SELECT * FROM challans 
                     WHERE challan_no = %s AND is_deleted = FALSE
                 """, (challan_no,))
+                
                 challan = cur.fetchone()
+                
+                # Debug log
+                logger.info(f"Fetched challan data: {challan}")
 
-                if not challan:
-                    return jsonify({"error": "Challan not found"}), 404
+
 
                 # Generate PDF
-                pdf_buffer = generate_challan_pdf(challan)
+                pdf_buffer = generate_challan_pdf(dict(challan))
                 
                 # Save PDF path in database
                 pdf_path = f"challans/{challan_no}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
@@ -88,7 +97,7 @@ def generate_pdf():
                 return response
     
     except Exception as e:
-        logger.error(f"Error generating PDF: {e}")
+        logger.error(f"Error in generate_pdf: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 def generate_challan_pdf(challan_data):
@@ -289,6 +298,38 @@ def health_check():
         logger.error(f"Health check failed: {e}")
         return jsonify({"status": "unhealthy", "error": str(e)}), 500
 
+# Add a route to check if challan exists
+@app.route('/api/challans/check/<challan_no>', methods=['GET'])
+def check_challan(challan_no):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT challan_no FROM challans 
+                    WHERE challan_no = %s AND is_deleted = FALSE
+                """, (challan_no,))
+                challan = cur.fetchone()
+                return jsonify({
+                    "exists": bool(challan),
+                    "challan_no": challan_no
+                })
+    except Exception as e:
+        logger.error(f"Error checking challan: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+# Make sure CORS is properly configured
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
+# Add an OPTIONS route handler
+@app.route('/api/generate-pdf', methods=['OPTIONS'])
+def generate_pdf_options():
+    return '', 200
+
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
