@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-# Replace Supabase connection with Neon connection manager
+# Database connection manager
 @contextmanager
 def get_db_connection():
     conn = None
@@ -34,7 +34,7 @@ def get_db_connection():
         conn = psycopg2.connect(
             os.getenv('DATABASE_URL'),
             cursor_factory=RealDictCursor,
-            sslmode='require'  # Neon requires SSL
+            sslmode='require'
         )
         yield conn
     except Exception as e:
@@ -51,6 +51,55 @@ def root():
         "message": "Voice Challan API is running"
     })
 
+@app.route('/api/challans', methods=['POST'])
+def create_challan():
+    try:
+        data = request.json
+        
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # Check if challan number already exists
+                cur.execute("""
+                    SELECT challan_no FROM challans 
+                    WHERE challan_no = %s AND is_deleted = FALSE
+                """, (data['challan_no'],))
+                
+                if cur.fetchone():
+                    return jsonify({"error": "Challan number already exists"}), 400
+                
+                # Insert new challan
+                cur.execute("""
+                    INSERT INTO challans (
+                        challan_no, 
+                        customer_name, 
+                        items, 
+                        total_items, 
+                        total_price, 
+                        created_at,
+                        is_deleted
+                    ) VALUES (%s, %s, %s, %s, %s, NOW(), FALSE)
+                    RETURNING id
+                """, (
+                    data['challan_no'],
+                    data['customer_name'],
+                    json.dumps(data['items']),
+                    data['total_items'],
+                    data['total_price']
+                ))
+                
+                challan_id = cur.fetchone()['id']
+                conn.commit()
+                
+                return jsonify({
+                    "message": "Challan created successfully",
+                    "challan_id": challan_id,
+                    "challan_no": data['challan_no']
+                }), 201
+                
+    except Exception as e:
+        logger.error(f"Error creating challan: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/generate-pdf', methods=['POST'])
 def generate_pdf():
     try:
@@ -62,7 +111,6 @@ def generate_pdf():
         
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                # Debug log
                 logger.info(f"Fetching challan with number: {challan_no}")
                 
                 cur.execute("""
@@ -71,24 +119,13 @@ def generate_pdf():
                 """, (challan_no,))
                 
                 challan = cur.fetchone()
-                
-                # Debug log
-                logger.info(f"Fetched challan data: {challan}")
 
-
+                if not challan:
+                    logger.error(f"No challan found with number: {challan_no}")
+                    return jsonify({"error": "Challan not found"}), 404
 
                 # Generate PDF
                 pdf_buffer = generate_challan_pdf(dict(challan))
-                
-                # Save PDF path in database
-                pdf_path = f"challans/{challan_no}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
-                
-                cur.execute("""
-                    UPDATE challans 
-                    SET pdf_path = %s 
-                    WHERE challan_no = %s
-                """, (pdf_path, challan_no))
-                conn.commit()
                 
                 response = make_response(pdf_buffer)
                 response.headers['Content-Type'] = 'application/pdf'
@@ -103,10 +140,12 @@ def generate_pdf():
 def generate_challan_pdf(challan_data):
     buffer = BytesIO()
     p = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4  # Standard A4 size
+    width, height = A4
     
-    # Parse items from JSON string
-    items = json.loads(challan_data['items'])
+    # Parse items from JSON string if it's a string
+    items = challan_data['items']
+    if isinstance(items, str):
+        items = json.loads(items)
     
     # Header
     p.setFont("Helvetica-Bold", 18)
@@ -116,7 +155,11 @@ def generate_challan_pdf(challan_data):
     p.setFont("Helvetica", 12)
     p.drawString(50, height - 100, f"Customer Name: {challan_data['customer_name']}")
     p.drawString(50, height - 120, f"Challan No: {challan_data['challan_no']}")
-    p.drawString(50, height - 140, f"Date: {challan_data['created_at'].strftime('%Y-%m-%d %H:%M:%S')}")
+    if isinstance(challan_data['created_at'], datetime):
+        created_at = challan_data['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+    else:
+        created_at = str(challan_data['created_at'])
+    p.drawString(50, height - 140, f"Date: {created_at}")
     
     # Items Table Header
     y_position = height - 180
@@ -134,11 +177,14 @@ def generate_challan_pdf(challan_data):
     y_position -= 25
     p.setFont("Helvetica", 10)
     
+    total_amount = 0
     for item in items:
-        p.drawString(50, y_position, item.get('name', ''))
+        p.drawString(50, y_position, item.get('description', ''))
         p.drawString(250, y_position, str(item.get('quantity', '')))
-        p.drawString(350, y_position, f"₹{item.get('price', 0):.2f}")
-        item_total = float(item.get('price', 0)) * float(item.get('quantity', 0))
+        price = float(item.get('price', 0))
+        p.drawString(350, y_position, f"₹{price:.2f}")
+        item_total = price * float(item.get('quantity', 0))
+        total_amount += item_total
         p.drawString(450, y_position, f"₹{item_total:.2f}")
         y_position -= 20
     
@@ -164,7 +210,6 @@ def generate_challan_pdf(challan_data):
     
     return pdf_value
 
-# Add a route to get the PDF by challan number
 @app.route('/api/challans/<challan_no>/pdf', methods=['GET'])
 def get_challan_pdf(challan_no):
     try:
@@ -179,7 +224,7 @@ def get_challan_pdf(challan_no):
                 if not challan:
                     return jsonify({"error": "Challan not found"}), 404
 
-                pdf_buffer = generate_challan_pdf(challan)
+                pdf_buffer = generate_challan_pdf(dict(challan))
                 
                 response = make_response(pdf_buffer)
                 response.headers['Content-Type'] = 'application/pdf'
@@ -200,91 +245,57 @@ def list_challans():
         start_date = request.args.get('start_date', '')
         end_date = request.args.get('end_date', '')
 
-        conn = get_db_connection()
-        query = '''
-            SELECT 
-                id, 
-                customer_name, 
-                challan_no, 
-                created_at, 
-                items, 
-                total_items, 
-                total_price, 
-                is_deleted
-            FROM challans 
-            WHERE is_deleted = false
-        '''
-        params = []
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                query = '''
+                    SELECT 
+                        id, 
+                        customer_name, 
+                        challan_no, 
+                        created_at, 
+                        items, 
+                        total_items, 
+                        total_price, 
+                        is_deleted
+                    FROM challans 
+                    WHERE is_deleted = false
+                '''
+                params = []
 
-        # Add search condition if search parameter is provided
-        if search:
-            query += """ AND (
-                customer_name ILIKE %s 
-                OR challan_no::text ILIKE %s
-            )"""
-            search_pattern = f'%{search}%'
-            params.extend([search_pattern, search_pattern])
+                if search:
+                    query += """ AND (
+                        customer_name ILIKE %s 
+                        OR challan_no::text ILIKE %s
+                    )"""
+                    search_pattern = f'%{search}%'
+                    params.extend([search_pattern, search_pattern])
 
-        # Add date range conditions if provided
-        if start_date:
-            query += " AND DATE(created_at) >= %s"
-            params.append(start_date)
-        if end_date:
-            query += " AND DATE(created_at) <= %s"
-            params.append(end_date)
+                if start_date:
+                    query += " AND DATE(created_at) >= %s"
+                    params.append(start_date)
+                if end_date:
+                    query += " AND DATE(created_at) <= %s"
+                    params.append(end_date)
 
-        # Add sorting
-        if sort in ['created_at', 'customer_name', 'challan_no', 'total_price']:
-            order = 'DESC' if order.upper() == 'DESC' else 'ASC'
-            query += f" ORDER BY {sort} {order}"
+                if sort in ['created_at', 'customer_name', 'challan_no', 'total_price']:
+                    order = 'DESC' if order.upper() == 'DESC' else 'ASC'
+                    query += f" ORDER BY {sort} {order}"
 
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute(query, params)
-            challans = cursor.fetchall()
-            
-        conn.close()
+                cur.execute(query, params)
+                challans = cur.fetchall()
 
-        # Convert DictRow objects to regular dictionaries and format the data
-        formatted_challans = []
-        for challan in challans:
-            challan_dict = dict(challan)
-            # Convert datetime to ISO format string
-            challan_dict['created_at'] = challan_dict['created_at'].isoformat()
-            # Parse JSON string to dictionary if it's a string
-            if isinstance(challan_dict['items'], str):
-                challan_dict['items'] = json.loads(challan_dict['items'])
-            formatted_challans.append(challan_dict)
+                formatted_challans = []
+                for challan in challans:
+                    challan_dict = dict(challan)
+                    challan_dict['created_at'] = challan_dict['created_at'].isoformat()
+                    if isinstance(challan_dict['items'], str):
+                        challan_dict['items'] = json.loads(challan_dict['items'])
+                    formatted_challans.append(challan_dict)
 
-        return jsonify(formatted_challans)
+                return jsonify(formatted_challans)
 
     except Exception as e:
         logger.error(f"Error listing challans: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/download-pdf/<int:challan_id>', methods=['GET'])
-def download_pdf(challan_id):
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute('SELECT pdf_data, challan_no FROM challans WHERE id = %s', (challan_id,))
-            result = cursor.fetchone()
-        
-        if not result:
-            return jsonify({'error': 'PDF not found'}), 404
-        
-        pdf_data, challan_no = result
-        
-        # Convert memoryview to bytes
-        if isinstance(pdf_data, memoryview):
-            pdf_data = pdf_data.tobytes()
-        
-        response = make_response(pdf_data)
-        response.headers['Content-Type'] = 'application/pdf'
-        response.headers['Content-Disposition'] = f'attachment; filename=challan_{challan_no}.pdf'
-        return response
-    
-    except Exception as e:
-        logger.error(f"Error downloading PDF: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/health', methods=['GET'])
@@ -298,37 +309,13 @@ def health_check():
         logger.error(f"Health check failed: {e}")
         return jsonify({"status": "unhealthy", "error": str(e)}), 500
 
-# Add a route to check if challan exists
-@app.route('/api/challans/check/<challan_no>', methods=['GET'])
-def check_challan(challan_no):
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT challan_no FROM challans 
-                    WHERE challan_no = %s AND is_deleted = FALSE
-                """, (challan_no,))
-                challan = cur.fetchone()
-                return jsonify({
-                    "exists": bool(challan),
-                    "challan_no": challan_no
-                })
-    except Exception as e:
-        logger.error(f"Error checking challan: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-# Make sure CORS is properly configured
+# Add CORS headers
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
     response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     return response
-
-# Add an OPTIONS route handler
-@app.route('/api/generate-pdf', methods=['OPTIONS'])
-def generate_pdf_options():
-    return '', 200
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
