@@ -10,6 +10,11 @@ from psycopg2.extras import RealDictCursor
 import base64
 from dotenv import load_dotenv
 from contextlib import contextmanager
+from io import BytesIO
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import inch
 
 # Load environment variables from .env
 load_dotenv()
@@ -46,93 +51,136 @@ def root():
         "message": "Voice Challan API is running"
     })
 
-@app.route('/api/generate-pdf', methods=['POST', 'OPTIONS'])
+@app.route('/api/generate-pdf', methods=['POST'])
 def generate_pdf():
-    if request.method == 'OPTIONS':
-        response = make_response()
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'POST,OPTIONS')
-        return response
-    
     try:
-        if not request.is_json:
-            return jsonify({'error': 'Content-Type must be application/json'}), 400
-        
         data = request.json
-        required_fields = ['items', 'customerName', 'challanNo']
-        missing_fields = [field for field in required_fields if field not in data]
+        challan_no = data.get('challan_no')
         
-        if missing_fields:
-            return jsonify({'error': f'Missing required fields: {", ".join(missing_fields)}'}), 400
-        
-        items = data['items']
-        if not isinstance(items, list) or not items:
-            return jsonify({'error': 'Items must be a non-empty array'}), 400
-        
-        customer_name = data['customerName']
-        challan_no = data['challanNo']
-        
-        # Generate PDF in memory
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Helvetica", '', 12)
-        
-        pdf.cell(200, 10, txt="Shakti Trading Co.", ln=True, align="C")
-        pdf.cell(200, 10, txt=f"Date: {datetime.now().strftime('%d-%m-%Y')}", ln=True, align="R")
-        pdf.cell(200, 10, txt=f"Customer: {customer_name}", ln=True, align="L")
-        pdf.cell(200, 10, txt=f"Challan No: {challan_no}", ln=True, align="L")
-        
-        pdf.set_font("Helvetica", 'B', 10)
-        pdf.cell(30, 10, "Quantity", 1, 0, "C")
-        pdf.cell(80, 10, "Description", 1, 0, "C")
-        pdf.cell(30, 10, "Price", 1, 0, "C")
-        pdf.cell(30, 10, "Total", 1, 1, "C")
-        
-        pdf.set_font("Helvetica", '', 10)
-        total_items = 0
-        total_price = 0
-        
-        for item in items:
-            quantity = item['quantity']
-            price = item.get('price', 0)
-            item_total = quantity * price
-            
-            pdf.cell(30, 10, str(quantity), 1, 0, "C")
-            pdf.cell(80, 10, item['description'], 1, 0, "L")
-            pdf.cell(30, 10, f"Rs {price:.2f}", 1, 0, "R")
-            pdf.cell(30, 10, f"Rs {item_total:.2f}", 1, 1, "R")
-            
-            total_items += quantity
-            total_price += item_total
-        
-        pdf.set_font("Helvetica", 'B', 10)
-        pdf.cell(140, 10, "Total", 1, 0, "R")
-        pdf.cell(30, 10, f"Rs {total_price:.2f}", 1, 1, "R")
-        
-        pdf_content = pdf.output(dest='S').encode('latin1')
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT * FROM challans 
+                    WHERE challan_no = %s AND is_deleted = FALSE
+                """, (challan_no,))
+                challan = cur.fetchone()
 
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute('''
-                INSERT INTO challans 
-                (customer_name, challan_no, pdf_data, items, total_items, total_price)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                RETURNING id
-            ''', (customer_name, challan_no, pdf_content, json.dumps(items), total_items, total_price))
-            challan_id = cursor.fetchone()[0]
-            conn.commit()
-        conn.close()
-        
-        return jsonify({
-            'message': 'PDF generated successfully',
-            'challanId': challan_id,
-            'challanNo': challan_no
-        })
-        
+                if not challan:
+                    return jsonify({"error": "Challan not found"}), 404
+
+                # Generate PDF
+                pdf_buffer = generate_challan_pdf(challan)
+                
+                # Save PDF path in database
+                pdf_path = f"challans/{challan_no}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
+                
+                cur.execute("""
+                    UPDATE challans 
+                    SET pdf_path = %s 
+                    WHERE challan_no = %s
+                """, (pdf_path, challan_no))
+                conn.commit()
+                
+                response = make_response(pdf_buffer)
+                response.headers['Content-Type'] = 'application/pdf'
+                response.headers['Content-Disposition'] = f'attachment; filename=challan_{challan_no}.pdf'
+                
+                return response
+    
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error generating PDF: {e}")
+        return jsonify({"error": str(e)}), 500
+
+def generate_challan_pdf(challan_data):
+    buffer = BytesIO()
+    p = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4  # Standard A4 size
+    
+    # Parse items from JSON string
+    items = json.loads(challan_data['items'])
+    
+    # Header
+    p.setFont("Helvetica-Bold", 18)
+    p.drawString(50, height - 50, "Challan Receipt")
+    
+    # Customer and Challan Details
+    p.setFont("Helvetica", 12)
+    p.drawString(50, height - 100, f"Customer Name: {challan_data['customer_name']}")
+    p.drawString(50, height - 120, f"Challan No: {challan_data['challan_no']}")
+    p.drawString(50, height - 140, f"Date: {challan_data['created_at'].strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Items Table Header
+    y_position = height - 180
+    p.setFont("Helvetica-Bold", 12)
+    p.drawString(50, y_position, "Item")
+    p.drawString(250, y_position, "Quantity")
+    p.drawString(350, y_position, "Price")
+    p.drawString(450, y_position, "Total")
+    
+    # Draw line under header
+    y_position -= 15
+    p.line(50, y_position, 550, y_position)
+    
+    # Items List
+    y_position -= 25
+    p.setFont("Helvetica", 10)
+    
+    for item in items:
+        p.drawString(50, y_position, item.get('name', ''))
+        p.drawString(250, y_position, str(item.get('quantity', '')))
+        p.drawString(350, y_position, f"₹{item.get('price', 0):.2f}")
+        item_total = float(item.get('price', 0)) * float(item.get('quantity', 0))
+        p.drawString(450, y_position, f"₹{item_total:.2f}")
+        y_position -= 20
+    
+    # Total Section
+    y_position -= 20
+    p.line(50, y_position, 550, y_position)
+    y_position -= 20
+    p.setFont("Helvetica-Bold", 12)
+    p.drawString(350, y_position, "Total Items:")
+    p.drawString(450, y_position, str(challan_data['total_items']))
+    y_position -= 20
+    p.drawString(350, y_position, "Total Amount:")
+    p.drawString(450, y_position, f"₹{challan_data['total_price']:.2f}")
+    
+    # Footer
+    p.setFont("Helvetica-Oblique", 8)
+    p.drawString(50, 30, "Thank you for your business!")
+    p.drawString(50, 15, f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    p.save()
+    pdf_value = buffer.getvalue()
+    buffer.close()
+    
+    return pdf_value
+
+# Add a route to get the PDF by challan number
+@app.route('/api/challans/<challan_no>/pdf', methods=['GET'])
+def get_challan_pdf(challan_no):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT * FROM challans 
+                    WHERE challan_no = %s AND is_deleted = FALSE
+                """, (challan_no,))
+                challan = cur.fetchone()
+
+                if not challan:
+                    return jsonify({"error": "Challan not found"}), 404
+
+                pdf_buffer = generate_challan_pdf(challan)
+                
+                response = make_response(pdf_buffer)
+                response.headers['Content-Type'] = 'application/pdf'
+                response.headers['Content-Disposition'] = f'attachment; filename=challan_{challan_no}.pdf'
+                
+                return response
+                
+    except Exception as e:
+        logger.error(f"Error fetching PDF: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/list-challans', methods=['GET'])
 def list_challans():
